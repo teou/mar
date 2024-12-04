@@ -6,7 +6,7 @@ import torch
 
 import util.misc as misc
 import util.lr_sched as lr_sched
-from models.vae import DiagonalGaussianDistribution
+from models.vae import DiagonalGaussianDistribution, AutoencoderKL
 import torch_fidelity
 import shutil
 import cv2
@@ -34,7 +34,7 @@ def train_one_epoch(model, vae,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,
                     log_writer=None,
-                    args=None):
+                    args=None, epoch_idx=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -59,19 +59,25 @@ def train_one_epoch(model, vae,
                 moments = samples
                 posterior = DiagonalGaussianDistribution(moments)
             else:
-                posterior = vae.encode(samples)
+                if isinstance(vae, AutoencoderKL):
+                    posterior = vae.encode(samples)
+                else:
+                    latent = vae.encode(samples)[0]
 
             # normalize the std of latent to be 1. Change it if you use a different tokenizer
-            x = posterior.sample().mul_(0.2325)
+            if isinstance(vae, AutoencoderKL):
+                x = posterior.sample().mul_(0.2325)
+            else:
+                x = latent
 
         # forward
-        with torch.cuda.amp.autocast():
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = model(x, labels)
 
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
+            print("epoch{}-iter{}, Loss is {}, stopping training".format(epoch, data_iter_step, loss_value))
             sys.exit(1)
 
         loss_scaler(loss, optimizer, clip_grad=args.grad_clip, parameters=model.parameters(), update_grad=True)
@@ -152,11 +158,14 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         # generation
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 sampled_tokens = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
                                                                  cfg_schedule=args.cfg_schedule, labels=labels_gen,
                                                                  temperature=args.temperature)
-                sampled_images = vae.decode(sampled_tokens / 0.2325)
+                if isinstance(vae, AutoencoderKL):
+                    sampled_images = vae.decode(sampled_tokens / 0.2325)
+                else:
+                    sampled_images = vae.decode(sampled_tokens)
 
         # measure speed after the first generation batch
         if i >= 1:

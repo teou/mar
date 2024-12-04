@@ -20,6 +20,7 @@ from models.vae import AutoencoderKL
 from models import mar
 from engine_mar import train_one_epoch, evaluate
 import copy
+from cosmos_tokenizer.image_lib import ImageTokenizer
 
 
 def get_args_parser():
@@ -129,6 +130,7 @@ def get_args_parser():
                         help='Use cached latents')
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
+    parser.add_argument('--tokenizer_type', default='vae', help='tokenizer type: vae or cosmos')
 
     return parser
 
@@ -185,7 +187,18 @@ def main(args):
     )
 
     # define the vae and mar model
-    vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
+    if args.tokenizer_type == 'cosmos':
+        vae = ImageTokenizer(
+            checkpoint = f"{args.vae_path}/autoencoder.jit",
+            checkpoint_enc = f"{args.vae_path}/encoder.jit", 
+            checkpoint_dec = f"{args.vae_path}/decoder.jit", 
+            device = "cuda",
+            dtype = "bfloat16",
+        ).eval()
+    else:
+        vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
+    print(f"tokenizer {vae}", flush=True)
+
     for param in vae.parameters():
         param.requires_grad = False
 
@@ -275,7 +288,8 @@ def main(args):
             data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
-            args=args
+            args=args,
+            epoch_idx=epoch,
         )
 
         # save checkpoint
@@ -306,5 +320,5 @@ if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    args.log_dir = args.output_dir
+    # args.log_dir = args.output_dir
     main(args)
