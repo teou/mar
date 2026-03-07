@@ -15,12 +15,12 @@ from util.crop import center_crop_arr
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.loader import CachedFolder
+from util.video_loader import VideoFrameDataset
 
 from models.vae import AutoencoderKL
 from models import mar
 from engine_mar import train_one_epoch, evaluate
 import copy
-from cosmos_tokenizer.image_lib import ImageTokenizer
 
 
 def get_args_parser():
@@ -97,6 +97,12 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='dataset path')
+    parser.add_argument('--video_data_path', default='', type=str,
+                        help='video dataset path (directory of per-video frame folders)')
+    parser.add_argument('--task', default='image_gen', type=str, choices=['image_gen', 'video_next_frame'],
+                        help='training task')
+    parser.add_argument('--context_len', default=4, type=int,
+                        help='number of context frames for video_next_frame task')
     parser.add_argument('--class_num', default=1000, type=int)
 
     parser.add_argument('--output_dir', default='./output_dir',
@@ -130,7 +136,6 @@ def get_args_parser():
                         help='Use cached latents')
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
-    parser.add_argument('--tokenizer_type', default='vae', help='tokenizer type: vae or cosmos')
 
     return parser
 
@@ -167,7 +172,11 @@ def main(args):
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
 
-    if args.use_cached:
+    if args.task == 'video_next_frame':
+        if not args.video_data_path:
+            raise ValueError("--video_data_path is required when --task video_next_frame")
+        dataset_train = VideoFrameDataset(args.video_data_path, context_len=args.context_len, transform=transform_train)
+    elif args.use_cached:
         dataset_train = CachedFolder(args.cached_path)
     else:
         dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
@@ -187,18 +196,7 @@ def main(args):
     )
 
     # define the vae and mar model
-    if args.tokenizer_type == 'cosmos':
-        vae = ImageTokenizer(
-            checkpoint = f"{args.vae_path}/autoencoder.jit",
-            checkpoint_enc = f"{args.vae_path}/encoder.jit", 
-            checkpoint_dec = f"{args.vae_path}/decoder.jit", 
-            device = "cuda",
-            dtype = "bfloat16",
-        ).eval()
-    else:
-        vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
-    print(f"tokenizer {vae}", flush=True)
-
+    vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
     for param in vae.parameters():
         param.requires_grad = False
 
@@ -218,6 +216,7 @@ def main(args):
         num_sampling_steps=args.num_sampling_steps,
         diffusion_batch_mul=args.diffusion_batch_mul,
         grad_checkpointing=args.grad_checkpointing,
+        context_len=args.context_len,
     )
 
     print("Model = %s" % str(model))
@@ -288,8 +287,7 @@ def main(args):
             data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
-            args=args,
-            epoch_idx=epoch,
+            args=args
         )
 
         # save checkpoint
@@ -320,5 +318,5 @@ if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    # args.log_dir = args.output_dir
+    args.log_dir = args.output_dir
     main(args)

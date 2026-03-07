@@ -1,0 +1,16 @@
+{
+  "dataset_path": "./data/real_eval_frames",
+  "steps": 30,
+  "loss_start5_avg": 1.0172969460487367,
+  "loss_end5_avg": 0.9207345843315125,
+  "loss_improvement": 0.09656236171722421,
+  "ckpt_path": "(generated during run; removed from report package)",
+  "triptych_image": "reports/e2e_report_real_2026-03-07/triptych_context_gt_pred.png",
+  "loss_curve_image": "reports/e2e_report_real_2026-03-07/tiny_overfit_loss_curve.png",
+  "pred_latent_shape": [
+    1,
+    16,
+    4,
+    4
+  ]
+}

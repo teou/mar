@@ -14,8 +14,10 @@ from models.diffloss import DiffLoss
 
 
 def mask_by_order(mask_len, order, bsz, seq_len):
-    masking = torch.zeros(bsz, seq_len).cuda()
-    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
+    device = order.device
+    masking = torch.zeros(bsz, seq_len, device=device)
+    src = torch.ones(bsz, seq_len, device=device)
+    masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=src).bool()
     return masking
 
 
@@ -38,6 +40,7 @@ class MAR(nn.Module):
                  num_sampling_steps='100',
                  diffusion_batch_mul=4,
                  grad_checkpointing=False,
+                 context_len=4,
                  ):
         super().__init__()
 
@@ -60,6 +63,8 @@ class MAR(nn.Module):
         self.label_drop_prob = label_drop_prob
         # Fake class embedding for CFG's unconditional generation
         self.fake_latent = nn.Parameter(torch.zeros(1, encoder_embed_dim))
+        self.context_len = context_len
+        self.context_proj = nn.Linear(self.token_embed_dim, encoder_embed_dim, bias=True)
 
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
@@ -156,7 +161,7 @@ class MAR(nn.Module):
             order = np.array(list(range(self.seq_len)))
             np.random.shuffle(order)
             orders.append(order)
-        orders = torch.Tensor(np.array(orders)).cuda().long()
+        orders = torch.as_tensor(np.array(orders), device=self.fake_latent.device).long()
         return orders
 
     def random_masking(self, x, orders):
@@ -179,8 +184,8 @@ class MAR(nn.Module):
 
         # random drop class embedding during training
         if self.training:
-            drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
-            drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
+            drop_latent_mask = torch.rand(bsz, device=x.device) < self.label_drop_prob
+            drop_latent_mask = drop_latent_mask.unsqueeze(-1).to(x.dtype)
             class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_embedding
 
         x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
@@ -237,9 +242,14 @@ class MAR(nn.Module):
         loss = self.diffloss(z=z, target=target, mask=mask)
         return loss
 
-    def forward(self, imgs, labels):
+    def forward(self, imgs, labels=None):
 
-        # class embed
+        # video mode: imgs is (context_tokens, target_tokens)
+        if isinstance(imgs, (tuple, list)) and len(imgs) == 2:
+            context_tokens, target_tokens = imgs
+            return self.forward_video(context_tokens, target_tokens, labels=labels)
+
+        # image mode
         class_embedding = self.class_emb(labels)
 
         # patchify and mask (drop) tokens
@@ -259,11 +269,81 @@ class MAR(nn.Module):
 
         return loss
 
+    def encode_context(self, context_tokens):
+        """
+        context_tokens: [B, T, L, D] where D=token_embed_dim
+        returns: context embedding [B, encoder_embed_dim]
+        """
+        context_summary = context_tokens.mean(dim=(1, 2))
+        return self.context_proj(context_summary)
+
+    def forward_video(self, context_tokens, target_tokens, labels=None):
+        # context_tokens: [B, T, L, D], target_tokens: [B, L, D]
+        if labels is not None:
+            class_embedding = self.class_emb(labels)
+        else:
+            class_embedding = self.encode_context(context_tokens)
+
+        x = target_tokens
+        gt_latents = x.clone().detach()
+        orders = self.sample_orders(bsz=x.size(0))
+        mask = self.random_masking(x, orders)
+
+        x = self.forward_mae_encoder(x, mask, class_embedding)
+        z = self.forward_mae_decoder(x, mask)
+        loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
+        return loss
+
+    def sample_next_frame(self, context_tokens, num_iter=64, cfg=1.0, cfg_schedule="linear", temperature=1.0, progress=False):
+        bsz = context_tokens.shape[0]
+        device = context_tokens.device
+        mask = torch.ones(bsz, self.seq_len, device=device)
+        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim, device=device)
+        orders = self.sample_orders(bsz)
+        class_embedding = self.encode_context(context_tokens)
+
+        indices = list(range(num_iter))
+        if progress:
+            indices = tqdm(indices)
+
+        for step in indices:
+            cur_tokens = tokens.clone()
+            x = self.forward_mae_encoder(tokens, mask, class_embedding)
+            z = self.forward_mae_decoder(x, mask)
+
+            mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+            mask_len = torch.tensor([np.floor(self.seq_len * mask_ratio)], device=device)
+            mask_len = torch.maximum(torch.tensor([1], device=device),
+                                     torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
+
+            mask_next = mask_by_order(mask_len[0], orders, bsz, self.seq_len)
+            if step >= num_iter - 1:
+                mask_to_pred = mask[:bsz].bool()
+            else:
+                mask_to_pred = torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
+            mask = mask_next
+
+            z = z[mask_to_pred.nonzero(as_tuple=True)]
+            if cfg_schedule == "linear":
+                cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
+            elif cfg_schedule == "constant":
+                cfg_iter = cfg
+            else:
+                raise NotImplementedError
+
+            sampled_token_latent = self.diffloss.sample(z, temperature, cfg_iter)
+            cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
+            tokens = cur_tokens.clone()
+
+        tokens = self.unpatchify(tokens)
+        return tokens
+
     def sample_tokens(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
 
+        device = self.fake_latent.device
         # init and sample generation orders
-        mask = torch.ones(bsz, self.seq_len).cuda()
-        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
+        mask = torch.ones(bsz, self.seq_len, device=device)
+        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim, device=device)
         orders = self.sample_orders(bsz)
 
         indices = list(range(num_iter))
@@ -291,10 +371,10 @@ class MAR(nn.Module):
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            mask_len = torch.Tensor([np.floor(self.seq_len * mask_ratio)]).cuda()
+            mask_len = torch.tensor([np.floor(self.seq_len * mask_ratio)], device=device)
 
             # masks out at least one for the next iteration
-            mask_len = torch.maximum(torch.Tensor([1]).cuda(),
+            mask_len = torch.maximum(torch.tensor([1], device=device),
                                      torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))
 
             # get masking for next iteration and locations to be predicted in this iteration

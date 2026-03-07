@@ -6,7 +6,7 @@ import torch
 
 import util.misc as misc
 import util.lr_sched as lr_sched
-from models.vae import DiagonalGaussianDistribution, AutoencoderKL
+from models.vae import DiagonalGaussianDistribution
 import torch_fidelity
 import shutil
 import cv2
@@ -34,7 +34,7 @@ def train_one_epoch(model, vae,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler,
                     log_writer=None,
-                    args=None, epoch_idx=None):
+                    args=None):
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -46,38 +46,53 @@ def train_one_epoch(model, vae,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        samples = samples.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        if args.task == 'video_next_frame':
+            context_frames, target_frame, _meta = batch
+            context_frames = context_frames.to(device, non_blocking=True)  # [B, T, C, H, W]
+            target_frame = target_frame.to(device, non_blocking=True)      # [B, C, H, W]
 
-        with torch.no_grad():
-            if args.use_cached:
-                moments = samples
-                posterior = DiagonalGaussianDistribution(moments)
-            else:
-                if isinstance(vae, AutoencoderKL):
-                    posterior = vae.encode(samples)
+            bsz, t, c, h, w = context_frames.shape
+            with torch.no_grad():
+                context_flat = context_frames.view(bsz * t, c, h, w)
+                posterior_ctx = vae.encode(context_flat)
+                x_ctx = posterior_ctx.sample().mul_(0.2325)
+                context_tokens = model.module.patchify(x_ctx) if hasattr(model, 'module') else model.patchify(x_ctx)
+                context_tokens = context_tokens.view(bsz, t, -1, context_tokens.shape[-1])
+
+                posterior_tgt = vae.encode(target_frame)
+                x_tgt = posterior_tgt.sample().mul_(0.2325)
+                target_tokens = model.module.patchify(x_tgt) if hasattr(model, 'module') else model.patchify(x_tgt)
+
+            with torch.cuda.amp.autocast():
+                loss = model((context_tokens, target_tokens), None)
+        else:
+            samples, labels = batch
+            samples = samples.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            with torch.no_grad():
+                if args.use_cached:
+                    moments = samples
+                    posterior = DiagonalGaussianDistribution(moments)
                 else:
-                    latent = vae.encode(samples)[0]
+                    posterior = vae.encode(samples)
 
-            # normalize the std of latent to be 1. Change it if you use a different tokenizer
-            if isinstance(vae, AutoencoderKL):
+                # normalize the std of latent to be 1. Change it if you use a different tokenizer
                 x = posterior.sample().mul_(0.2325)
-            else:
-                x = latent
 
-        # forward
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = model(x, labels)
+            # forward
+            with torch.cuda.amp.autocast():
+                loss = model(x, labels)
 
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
-            print("epoch{}-iter{}, Loss is {}, stopping training".format(epoch, data_iter_step, loss_value))
+            print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
         loss_scaler(loss, optimizer, clip_grad=args.grad_clip, parameters=model.parameters(), update_grad=True)
@@ -158,14 +173,11 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
 
         # generation
         with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.cuda.amp.autocast():
                 sampled_tokens = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
                                                                  cfg_schedule=args.cfg_schedule, labels=labels_gen,
                                                                  temperature=args.temperature)
-                if isinstance(vae, AutoencoderKL):
-                    sampled_images = vae.decode(sampled_tokens / 0.2325)
-                else:
-                    sampled_images = vae.decode(sampled_tokens)
+                sampled_images = vae.decode(sampled_tokens / 0.2325)
 
         # measure speed after the first generation batch
         if i >= 1:

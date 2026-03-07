@@ -1,0 +1,15 @@
+{
+  "steps": 30,
+  "loss_start5_avg": 1.0188830971717835,
+  "loss_end5_avg": 0.9717783451080322,
+  "loss_improvement": 0.04710475206375131,
+  "ckpt_path": "reports/e2e_report_2026-03-07/tiny_overfit_ckpt.pth",
+  "triptych_image": "reports/e2e_report_2026-03-07/triptych_context_gt_pred.png",
+  "loss_curve_image": "reports/e2e_report_2026-03-07/tiny_overfit_loss_curve.png",
+  "pred_latent_shape": [
+    1,
+    16,
+    4,
+    4
+  ]
+}
