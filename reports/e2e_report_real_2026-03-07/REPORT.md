@@ -177,7 +177,7 @@ PYTHONPATH=. python3 scripts/eval_copy_last_baseline.py \
 命令：
 ```bash
 cd /Users/niubobo/.openclaw/workspace/mar
-PYTHONPATH=. python3 scripts/tiny_overfit_real_eval.py \
+PYTHONPATH=. python3 scripts/openclaw_tiny_overfit_real_eval.py \
   --video_data_path ./data/real_eval_frames \
   --report_dir ./reports/e2e_report_real_2026-03-07 \
   --img_size 64 \
