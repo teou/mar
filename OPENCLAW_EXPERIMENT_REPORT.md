@@ -496,8 +496,42 @@ PYTHONPATH=. python3 scripts/openclaw_tiny_overfit_real_eval.py \
 
 ---
 
+## 附录：E2E 报告索引（随本实验一并附上）
+
+### A. E2E 基础版报告（dummy/基础验证）
+
+- 报告：`reports/e2e_report_2026-03-07/REPORT.md`
+- 目录内主要材料：
+  - `unit_tests.txt`
+  - `smoke_test.txt`
+  - `baseline_eval.txt`
+  - `tiny_overfit_metrics.json`
+  - `tiny_overfit_loss_curve.png`
+  - `triptych_context_gt_pred.png`
+
+### B. E2E 真实数据版报告（mp4 抽帧验证）
+
+- 报告：`reports/e2e_report_real_2026-03-07/REPORT.md`
+- 目录内主要材料：
+  - `unit_tests.txt`
+  - `smoke_test.txt`
+  - `baseline_eval.txt`
+  - `tiny_overfit_run.txt`
+  - `tiny_overfit_metrics.json`
+  - `tiny_overfit_loss_curve.png`
+  - `triptych_context_gt_pred.png`
+
+### C. 与主实验报告关系
+
+- 本文（`OPENCLAW_EXPERIMENT_REPORT.md`）用于记录需求、过程、复盘与验收结论；
+- 上述 E2E 报告用于提供可执行命令、原始日志与可视化证据。
+
+---
+
 ## 附录：本报告使用的材料
 
 - `mar/chat_history.md`
 - 聊天中提及的提交：`452aa6a`、`dae53f5`、`07fb0d0`、`4e34573`、`4a61f06`
-- 聊天中汇报的 UT/E2E 结果与可视化产物路径（`reports/e2e_report_2026-03-07/`）
+- 本实验对应 E2E 材料：
+  - `reports/e2e_report_2026-03-07/`
+  - `reports/e2e_report_real_2026-03-07/`
