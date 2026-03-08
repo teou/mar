@@ -295,6 +295,19 @@ PYTHONPATH=. python3 scripts/openclaw_tiny_overfit_real_eval.py \
 - **本次代码改动已满足“视频下一帧预测 MVP 验证目标”**；
 - 若按“生产级/研究完备”标准，还需补充大规模评估与更严格对照实验。
 
+#### 4.4.1 验收矩阵表（需求项 / 证据 / 结论）
+
+| 需求项 | 验收标准 | 证据（脚本/日志/产物） | 结果判定 | 备注/风险 |
+|---|---|---|---|---|
+| 支持“前 n 帧 → 下一帧”任务链路 | 能读取视频连续帧并形成 context+target 样本 | `util/video_loader.py`；`tests/test_video_loader.py`；`unit_tests.txt` | ✅ 满足 | 当前样本规模较小 |
+| 模型支持视频条件前向 | `forward_video` 能返回有效有限 loss | `models/mar.py`；`tests/test_mar_video_forward.py`；UT `4 passed` | ✅ 满足 | 仍属 MVP 结构 |
+| 端到端链路可运行 | 数据→VAE→MAR 前向流程不报错 | `scripts/smoke_video_next_frame.py`；`smoke_test.txt`（`Smoke OK`） | ✅ 满足 | 主要在 CPU 环境验证 |
+| 基线可计算并可对照 | 能产出 copy-last baseline 指标 | `scripts/eval_copy_last_baseline.py`；`baseline_eval.txt` | ✅ 满足 | 目前以 PSNR 为主 |
+| 模型具备可学习性 | tiny-overfit 下 loss 有下降 | `scripts/openclaw_tiny_overfit_real_eval.py`；`tiny_overfit_metrics.json`（`+0.0966` 改善） | ✅ 满足（MVP） | 仅证明可学习，不等于最优效果 |
+| 推理与结果可视化 | 能导出预测结果与对比图 | `triptych_context_gt_pred.png`；`tiny_overfit_loss_curve.png` | ✅ 满足 | 视觉质量仍需更大规模评估 |
+| 真实视频数据验证 | 从 mp4 下载、抽帧、构建数据集并完成 E2E | `reports/e2e_report_real_2026-03-07/REPORT.md` + 对应日志 | ✅ 满足 | 该流程由 Codex 自主设计 |
+| “满足原需求”最终判断 | 达到“可验证改动 + 端到端测试”目标 | 上述 UT/E2E/可视化证据链 | ✅ 满足（MVP验收通过） | 若按生产级标准，需补全大规模统计评估 |
+
 ---
 
 ## 5. 实验经验与教训
