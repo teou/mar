@@ -182,9 +182,116 @@
 - Tiny-overfit：loss 出现下降（约 +0.047 改善）
 - ckpt 加载后推理可运行（形状正常）
 
-结论：
+### 4.3 真实视频数据端到端验证（详细过程）
 
-- **MVP 验证闭环已成立**：实现可运行、可测试、可度量。
+为避免仅在 dummy 数据上“自洽”，本实验进一步执行了真实视频数据验证，流程如下。
+
+#### Step 1：下载真实 mp4 样例视频
+
+- 原始视频：`data/real_videos_raw/bbb.mp4`
+- 来源：公开 sample 视频
+
+示例命令：
+
+```bash
+cd /Users/niubobo/.openclaw/workspace/mar
+mkdir -p data/real_videos_raw
+curl -L --fail -o data/real_videos_raw/bbb.mp4 https://samplelib.com/lib/preview/mp4/sample-5s.mp4
+```
+
+#### Step 2：从 mp4 抽帧并构建评估数据集
+
+- 抽帧策略：每 3 帧取 1 帧
+- 预处理：统一 resize 到 `128x128`
+- 组织方式：切分为 3 段短序列，每段 10 帧
+  - `data/real_eval_frames/video_000`
+  - `data/real_eval_frames/video_001`
+  - `data/real_eval_frames/video_002`
+
+该格式与 `util/video_loader.py` 约定一致，可直接用于 `context_len=4` 的视频下一帧任务。
+
+#### Step 3：跑真实数据 smoke（链路可运行性）
+
+命令（节选）：
+
+```bash
+PYTHONPATH=. python3 scripts/smoke_video_next_frame.py \
+  --video_data_path ./data/real_eval_frames \
+  --img_size 64 --context_len 4 --batch_size 1 --device cpu \
+  --vae_path pretrained_models/vae/kl16.ckpt
+```
+
+结果（真实数据报告记录）：
+
+- `Smoke OK`
+- `loss=1.001144`
+- `baseline_psnr=31.9340`
+
+#### Step 4：跑 baseline（copy-last-frame）
+
+命令（节选）：
+
+```bash
+PYTHONPATH=. python3 scripts/eval_copy_last_baseline.py \
+  --video_data_path ./data/real_eval_frames \
+  --context_len 4 --img_size 64 --batch_size 2 --max_batches 8
+```
+
+结果：
+
+- `copy-last baseline avg PSNR over 8 batches: 30.5839`
+
+#### Step 5：跑 tiny-overfit（可学习性验证）
+
+命令（节选）：
+
+```bash
+PYTHONPATH=. python3 scripts/openclaw_tiny_overfit_real_eval.py \
+  --video_data_path ./data/real_eval_frames \
+  --report_dir ./reports/e2e_report_real_2026-03-07 \
+  --img_size 64 --context_len 4 --steps 30 --lr 3e-5 --device cpu \
+  --vae_path pretrained_models/vae/kl16.ckpt
+```
+
+结果：
+
+- `loss_start5_avg=1.0173`
+- `loss_end5_avg=0.9207`
+- `loss_improvement=+0.0966`（loss 明显下降）
+- `pred_latent_shape=[1,16,4,4]`
+
+并产出可视化：
+
+- `tiny_overfit_loss_curve.png`
+- `triptych_context_gt_pred.png`
+
+#### Step 6：结果文件与可审计材料
+
+完整材料已沉淀在：
+
+- `reports/e2e_report_real_2026-03-07/REPORT.md`
+- `reports/e2e_report_real_2026-03-07/unit_tests.txt`
+- `reports/e2e_report_real_2026-03-07/smoke_test.txt`
+- `reports/e2e_report_real_2026-03-07/baseline_eval.txt`
+- `reports/e2e_report_real_2026-03-07/tiny_overfit_metrics.json`
+
+### 4.4 这些 E2E 是否最终证明“满足需求”？
+
+结论分层如下：
+
+1. **已被证明（MVP层）**
+   - 代码改造链路成立：前 n 帧条件输入 + 下一帧目标训练路径可运行；
+   - 在真实视频帧数据上可完成训练/推理/可视化；
+   - 具备可测试、可复现、可审计证据链（UT + E2E + 日志 + 图）。
+
+2. **尚未被完全证明（产品/研究完备层）**
+   - 目前主要证明“可运行与可学习”，尚未在更大规模真实数据上完成系统性指标对比（如 PSNR/SSIM/LPIPS 全量统计）；
+   - 尚未给出多视频、多场景、长时预测稳定性的充分统计结论。
+
+因此，本次结论应表述为：
+
+- **本次代码改动已满足“视频下一帧预测 MVP 验证目标”**；
+- 若按“生产级/研究完备”标准，还需补充大规模评估与更严格对照实验。
 
 ---
 
