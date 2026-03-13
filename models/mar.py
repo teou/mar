@@ -64,7 +64,8 @@ class MAR(nn.Module):
         # Fake class embedding for CFG's unconditional generation
         self.fake_latent = nn.Parameter(torch.zeros(1, encoder_embed_dim))
         self.context_len = context_len
-        self.context_proj = nn.Linear(self.token_embed_dim, encoder_embed_dim, bias=True)
+        self.context_temporal_embed = nn.Parameter(torch.zeros(1, context_len, 1, encoder_embed_dim))
+        self.context_spatial_embed = nn.Parameter(torch.zeros(1, 1, self.seq_len, encoder_embed_dim))
 
         # --------------------------------------------------------------------------
         # MAR variant masking ratio, a left-half truncated Gaussian centered at 100% masking ratio with std 0.25
@@ -117,6 +118,8 @@ class MAR(nn.Module):
         torch.nn.init.normal_(self.encoder_pos_embed_learned, std=.02)
         torch.nn.init.normal_(self.decoder_pos_embed_learned, std=.02)
         torch.nn.init.normal_(self.diffusion_pos_embed_learned, std=.02)
+        torch.nn.init.normal_(self.context_temporal_embed, std=.02)
+        torch.nn.init.normal_(self.context_spatial_embed, std=.02)
 
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
@@ -174,7 +177,7 @@ class MAR(nn.Module):
                              src=torch.ones(bsz, seq_len, device=x.device))
         return mask
 
-    def forward_mae_encoder(self, x, mask, class_embedding):
+    def forward_mae_encoder(self, x, mask, class_embedding, context_prefix=None):
         x = self.z_proj(x)
         bsz, seq_len, embed_dim = x.shape
 
@@ -197,6 +200,10 @@ class MAR(nn.Module):
         # dropping
         x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, embed_dim)
 
+        # prepend context prefix
+        if context_prefix is not None:
+            x = torch.cat([context_prefix, x], dim=1)
+
         # apply Transformer blocks
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for block in self.encoder_blocks:
@@ -208,7 +215,9 @@ class MAR(nn.Module):
 
         return x
 
-    def forward_mae_decoder(self, x, mask):
+    def forward_mae_decoder(self, x, mask, context_prefix_len=0):
+        if context_prefix_len > 0:
+            x = x[:, context_prefix_len:]
 
         x = self.decoder_embed(x)
         mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
@@ -269,28 +278,32 @@ class MAR(nn.Module):
 
         return loss
 
-    def encode_context(self, context_tokens):
+    def _prepare_context_prefix(self, context_tokens):
         """
-        context_tokens: [B, T, L, D] where D=token_embed_dim
-        returns: context embedding [B, encoder_embed_dim]
+        context_tokens: [B, T, L, D] (token_embed_dim)
+        returns: [B, T*L, encoder_embed_dim] context prefix with position encoding
         """
-        context_summary = context_tokens.mean(dim=(1, 2))
-        return self.context_proj(context_summary)
+        bsz, t, l, d = context_tokens.shape
+        ctx = context_tokens.reshape(bsz, t * l, d)
+        ctx = self.z_proj(ctx)
+        ctx = ctx.reshape(bsz, t, l, -1)
+        ctx = ctx + self.context_temporal_embed + self.context_spatial_embed
+        ctx = ctx.reshape(bsz, t * l, -1)
+        ctx = self.z_proj_ln(ctx)
+        return ctx
 
     def forward_video(self, context_tokens, target_tokens, labels=None):
         # context_tokens: [B, T, L, D], target_tokens: [B, L, D]
-        if labels is not None:
-            class_embedding = self.class_emb(labels)
-        else:
-            class_embedding = self.encode_context(context_tokens)
+        context_prefix = self._prepare_context_prefix(context_tokens)
+        class_embedding = self.fake_latent.expand(target_tokens.size(0), -1)
 
         x = target_tokens
         gt_latents = x.clone().detach()
         orders = self.sample_orders(bsz=x.size(0))
         mask = self.random_masking(x, orders)
 
-        x = self.forward_mae_encoder(x, mask, class_embedding)
-        z = self.forward_mae_decoder(x, mask)
+        x = self.forward_mae_encoder(x, mask, class_embedding, context_prefix=context_prefix)
+        z = self.forward_mae_decoder(x, mask, context_prefix_len=context_prefix.size(1))
         loss = self.forward_loss(z=z, target=gt_latents, mask=mask)
         return loss
 
@@ -300,7 +313,9 @@ class MAR(nn.Module):
         mask = torch.ones(bsz, self.seq_len, device=device)
         tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim, device=device)
         orders = self.sample_orders(bsz)
-        class_embedding = self.encode_context(context_tokens)
+        context_prefix = self._prepare_context_prefix(context_tokens)
+        class_embedding = self.fake_latent.expand(bsz, -1)
+        ctx_len = context_prefix.size(1)
 
         indices = list(range(num_iter))
         if progress:
@@ -308,8 +323,8 @@ class MAR(nn.Module):
 
         for step in indices:
             cur_tokens = tokens.clone()
-            x = self.forward_mae_encoder(tokens, mask, class_embedding)
-            z = self.forward_mae_decoder(x, mask)
+            x = self.forward_mae_encoder(tokens, mask, class_embedding, context_prefix=context_prefix)
+            z = self.forward_mae_decoder(x, mask, context_prefix_len=ctx_len)
 
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
             mask_len = torch.tensor([np.floor(self.seq_len * mask_ratio)], device=device)

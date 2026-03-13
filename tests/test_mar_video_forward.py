@@ -37,7 +37,7 @@ def test_forward_video_returns_finite_scalar_on_cpu():
     assert torch.isfinite(loss).item()
 
 
-def test_encode_context_changes_with_input():
+def test_prepare_context_prefix_changes_with_input():
     model = MAR(
         img_size=32,
         vae_stride=16,
@@ -59,6 +59,7 @@ def test_encode_context_changes_with_input():
     c1 = torch.zeros(bsz, t, seq_len, token_dim)
     c2 = torch.ones(bsz, t, seq_len, token_dim)
 
-    e1 = model.encode_context(c1)
-    e2 = model.encode_context(c2)
-    assert not torch.allclose(e1, e2)
+    p1 = model._prepare_context_prefix(c1)
+    p2 = model._prepare_context_prefix(c2)
+    assert p1.shape == (bsz, t * seq_len, 64)
+    assert not torch.allclose(p1, p2)
