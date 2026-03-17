@@ -94,6 +94,16 @@ def get_args_parser():
     parser.add_argument('--diffusion_batch_mul', type=int, default=1)
     parser.add_argument('--temperature', default=1.0, type=float, help='diffusion loss sampling temperature')
 
+    # Flow Matching params
+    parser.add_argument('--diffloss_type', type=str, default='ddpm', choices=['ddpm', 'flow'],
+                        help='diffusion loss type: ddpm (epsilon-prediction) or flow (x-prediction flow matching)')
+    parser.add_argument('--flow_P_mean', type=float, default=-0.8, help='logit-normal mean for flow time sampling')
+    parser.add_argument('--flow_P_std', type=float, default=0.8, help='logit-normal std for flow time sampling')
+    parser.add_argument('--flow_noise_scale', type=float, default=1.0, help='noise scale for flow matching')
+    parser.add_argument('--flow_t_eps', type=float, default=0.05, help='minimum (1-t) clamp for flow matching')
+    parser.add_argument('--flow_sampling_method', type=str, default='euler', choices=['euler', 'heun'],
+                        help='ODE solver for flow matching sampling')
+
     # Dataset parameters
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='dataset path')
@@ -234,6 +244,12 @@ def main(args):
         diffusion_batch_mul=args.diffusion_batch_mul,
         grad_checkpointing=args.grad_checkpointing,
         context_len=args.context_len,
+        diffloss_type=args.diffloss_type,
+        flow_P_mean=args.flow_P_mean,
+        flow_P_std=args.flow_P_std,
+        flow_noise_scale=args.flow_noise_scale,
+        flow_t_eps=args.flow_t_eps,
+        flow_sampling_method=args.flow_sampling_method,
     )
 
     print("Model = %s" % str(model))

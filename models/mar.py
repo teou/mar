@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from timm.models.vision_transformer import Block
 
-from models.diffloss import DiffLoss
+from models.diffloss import DiffLoss, FlowDiffLoss
 
 
 def mask_by_order(mask_len, order, bsz, seq_len):
@@ -41,6 +41,12 @@ class MAR(nn.Module):
                  diffusion_batch_mul=4,
                  grad_checkpointing=False,
                  context_len=4,
+                 diffloss_type='ddpm',
+                 flow_P_mean=-0.8,
+                 flow_P_std=0.8,
+                 flow_noise_scale=1.0,
+                 flow_t_eps=0.05,
+                 flow_sampling_method='euler',
                  ):
         super().__init__()
 
@@ -100,14 +106,29 @@ class MAR(nn.Module):
 
         # --------------------------------------------------------------------------
         # Diffusion Loss
-        self.diffloss = DiffLoss(
-            target_channels=self.token_embed_dim,
-            z_channels=decoder_embed_dim,
-            width=diffloss_w,
-            depth=diffloss_d,
-            num_sampling_steps=num_sampling_steps,
-            grad_checkpointing=grad_checkpointing
-        )
+        if diffloss_type == 'flow':
+            self.diffloss = FlowDiffLoss(
+                target_channels=self.token_embed_dim,
+                z_channels=decoder_embed_dim,
+                width=diffloss_w,
+                depth=diffloss_d,
+                num_sampling_steps=num_sampling_steps,
+                grad_checkpointing=grad_checkpointing,
+                P_mean=flow_P_mean,
+                P_std=flow_P_std,
+                noise_scale=flow_noise_scale,
+                t_eps=flow_t_eps,
+                sampling_method=flow_sampling_method,
+            )
+        else:
+            self.diffloss = DiffLoss(
+                target_channels=self.token_embed_dim,
+                z_channels=decoder_embed_dim,
+                width=diffloss_w,
+                depth=diffloss_d,
+                num_sampling_steps=num_sampling_steps,
+                grad_checkpointing=grad_checkpointing
+            )
         self.diffusion_batch_mul = diffusion_batch_mul
 
     def initialize_weights(self):

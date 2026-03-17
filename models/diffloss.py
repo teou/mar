@@ -247,3 +247,207 @@ class SimpleMLPAdaLN(nn.Module):
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
+
+
+class SimpleMLPAdaLNFlow(nn.Module):
+    """
+    MLP for Flow Matching Loss (x-prediction, no learned variance).
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        model_channels,
+        out_channels,
+        z_channels,
+        num_res_blocks,
+        grad_checkpointing=False
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.model_channels = model_channels
+        self.out_channels = out_channels
+        self.num_res_blocks = num_res_blocks
+        self.grad_checkpointing = grad_checkpointing
+
+        self.time_embed = TimestepEmbedder(model_channels)
+        self.cond_embed = nn.Linear(z_channels, model_channels)
+
+        self.input_proj = nn.Linear(in_channels, model_channels)
+
+        res_blocks = []
+        for i in range(num_res_blocks):
+            res_blocks.append(ResBlock(model_channels))
+
+        self.res_blocks = nn.ModuleList(res_blocks)
+        self.final_layer = FinalLayer(model_channels, out_channels)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        nn.init.normal_(self.time_embed.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.time_embed.mlp[2].weight, std=0.02)
+
+        for block in self.res_blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def forward(self, x, t, c):
+        """
+        :param x: [N x C] noisy input.
+        :param t: 1-D continuous timesteps in [0, 1].
+        :param c: conditioning from AR transformer.
+        :return: [N x C] x-prediction.
+        """
+        x = self.input_proj(x)
+        # Scale t from [0,1] to [0,1000] for sinusoidal embedding
+        t = self.time_embed(t * 1000.0)
+        c = self.cond_embed(c)
+
+        y = t + c
+
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            for block in self.res_blocks:
+                x = checkpoint(block, x, y)
+        else:
+            for block in self.res_blocks:
+                x = block(x, y)
+
+        return self.final_layer(x, y)
+
+    def forward_with_cfg(self, x, t, c, cfg_scale, t_eps=0.05):
+        """CFG in v-space (velocity direction interpolation)."""
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        x_pred = self.forward(combined, t, c)
+
+        # Convert x-prediction to v-prediction: v = (x_pred - z_t) / (1 - t)
+        one_minus_t = (1.0 - t).clamp_min(t_eps).to(x_pred.dtype)
+        if one_minus_t.dim() == 1:
+            one_minus_t = one_minus_t.unsqueeze(-1)
+        v_pred = (x_pred - combined) / one_minus_t
+
+        v_cond, v_uncond = torch.split(v_pred, len(v_pred) // 2, dim=0)
+        cfg_scale = torch.as_tensor(cfg_scale, dtype=x_pred.dtype, device=x_pred.device)
+        guided_v = v_uncond + cfg_scale * (v_cond - v_uncond)
+        guided_v = torch.cat([guided_v, guided_v], dim=0)
+
+        return combined + one_minus_t * guided_v
+
+
+class FlowDiffLoss(nn.Module):
+    """Flow Matching Loss with x-prediction and v-loss (JiT-style)."""
+
+    def __init__(self, target_channels, z_channels, depth, width,
+                 num_sampling_steps=50, grad_checkpointing=False,
+                 P_mean=-0.8, P_std=0.8, noise_scale=1.0,
+                 t_eps=0.05, sampling_method='euler'):
+        super(FlowDiffLoss, self).__init__()
+        self.in_channels = target_channels
+        self.net = SimpleMLPAdaLNFlow(
+            in_channels=target_channels,
+            model_channels=width,
+            out_channels=target_channels,  # no learned variance
+            z_channels=z_channels,
+            num_res_blocks=depth,
+            grad_checkpointing=grad_checkpointing
+        )
+
+        self.P_mean = P_mean
+        self.P_std = P_std
+        self.noise_scale = noise_scale
+        self.t_eps = t_eps
+        self.num_sampling_steps = int(num_sampling_steps)
+        self.sampling_method = sampling_method
+
+    def forward(self, target, z, mask=None):
+        bsz = target.shape[0]
+        device = target.device
+
+        # Logit-normal time sampling
+        u = torch.randn(bsz, device=device) * self.P_std + self.P_mean
+        t = torch.sigmoid(u)  # t in (0, 1)
+
+        # Interpolate: z_t = t * target + (1 - t) * noise
+        noise = torch.randn_like(target) * self.noise_scale
+        t_expand = t.unsqueeze(-1)
+        z_t = t_expand * target + (1.0 - t_expand) * noise
+
+        # x-prediction
+        x_pred = self.net(z_t, t, z)
+
+        # v-loss: loss on velocity space
+        # v_pred = (x_pred - z_t) / (1 - t), v_target = (target - z_t) / (1 - t)
+        # MSE in v-space = MSE(x_pred, target) / (1 - t)^2
+        one_minus_t = (1.0 - t_expand).clamp_min(self.t_eps)
+        loss = ((x_pred - target) / one_minus_t) ** 2
+        loss = loss.mean(dim=-1)  # mean over channels
+
+        if mask is not None:
+            loss = (loss * mask).sum() / mask.sum()
+        return loss.mean()
+
+    def sample(self, z, temperature=1.0, cfg=1.0):
+        device = z.device
+        N = self.num_sampling_steps
+        dt = 1.0 / N
+
+        if not cfg == 1.0:
+            noise = torch.randn(z.shape[0] // 2, self.in_channels, device=device) * temperature
+            noise = torch.cat([noise, noise], dim=0)
+            model_kwargs = dict(c=z, cfg_scale=cfg, t_eps=self.t_eps)
+            sample_fn = self.net.forward_with_cfg
+        else:
+            noise = torch.randn(z.shape[0], self.in_channels, device=device) * temperature
+            model_kwargs = dict(c=z)
+            sample_fn = self.net.forward
+
+        x_t = noise  # start at t=0 (pure noise)
+
+        for i in range(N):
+            t_cur = torch.full((x_t.shape[0],), i * dt, device=device, dtype=torch.float32)
+
+            x_pred = sample_fn(x_t, t_cur, **model_kwargs)
+
+            if self.sampling_method == 'euler':
+                # velocity: v = (x_pred - x_t) / (1 - t)
+                one_minus_t = (1.0 - t_cur).clamp_min(self.t_eps)
+                if one_minus_t.dim() == 1:
+                    one_minus_t = one_minus_t.unsqueeze(-1)
+                v = (x_pred - x_t) / one_minus_t
+                x_t = x_t + v * dt
+
+            elif self.sampling_method == 'heun':
+                one_minus_t = (1.0 - t_cur).clamp_min(self.t_eps)
+                if one_minus_t.dim() == 1:
+                    one_minus_t = one_minus_t.unsqueeze(-1)
+                v1 = (x_pred - x_t) / one_minus_t
+                x_t_next = x_t + v1 * dt
+
+                if i < N - 1:
+                    t_next = torch.full((x_t.shape[0],), (i + 1) * dt, device=device, dtype=torch.float32)
+                    x_pred_next = sample_fn(x_t_next, t_next, **model_kwargs)
+                    one_minus_t_next = (1.0 - t_next).clamp_min(self.t_eps)
+                    if one_minus_t_next.dim() == 1:
+                        one_minus_t_next = one_minus_t_next.unsqueeze(-1)
+                    v2 = (x_pred_next - x_t_next) / one_minus_t_next
+                    x_t = x_t + 0.5 * (v1 + v2) * dt
+                else:
+                    x_t = x_t_next
+            else:
+                raise ValueError(f"Unknown sampling method: {self.sampling_method}")
+
+        return x_t
