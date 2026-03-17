@@ -58,15 +58,22 @@ def train_one_epoch(model, vae,
 
             bsz, t, c, h, w = context_frames.shape
             with torch.no_grad():
-                context_flat = context_frames.view(bsz * t, c, h, w)
-                posterior_ctx = vae.encode(context_flat)
-                x_ctx = posterior_ctx.sample().mul_(0.2325)
-                context_tokens = model.module.patchify(x_ctx) if hasattr(model, 'module') else model.patchify(x_ctx)
-                context_tokens = context_tokens.view(bsz, t, -1, context_tokens.shape[-1])
+                if getattr(args, 'no_vae', False):
+                    context_flat = context_frames.view(bsz * t, c, h, w)
+                    _patchify = model.module.patchify if hasattr(model, 'module') else model.patchify
+                    context_tokens = _patchify(context_flat)
+                    context_tokens = context_tokens.view(bsz, t, -1, context_tokens.shape[-1])
+                    target_tokens = _patchify(target_frame)
+                else:
+                    context_flat = context_frames.view(bsz * t, c, h, w)
+                    posterior_ctx = vae.encode(context_flat)
+                    x_ctx = posterior_ctx.sample().mul_(0.2325)
+                    context_tokens = model.module.patchify(x_ctx) if hasattr(model, 'module') else model.patchify(x_ctx)
+                    context_tokens = context_tokens.view(bsz, t, -1, context_tokens.shape[-1])
 
-                posterior_tgt = vae.encode(target_frame)
-                x_tgt = posterior_tgt.sample().mul_(0.2325)
-                target_tokens = model.module.patchify(x_tgt) if hasattr(model, 'module') else model.patchify(x_tgt)
+                    posterior_tgt = vae.encode(target_frame)
+                    x_tgt = posterior_tgt.sample().mul_(0.2325)
+                    target_tokens = model.module.patchify(x_tgt) if hasattr(model, 'module') else model.patchify(x_tgt)
 
             with torch.cuda.amp.autocast():
                 loss = model((context_tokens, target_tokens), None)
@@ -76,14 +83,16 @@ def train_one_epoch(model, vae,
             labels = labels.to(device, non_blocking=True)
 
             with torch.no_grad():
-                if args.use_cached:
+                if getattr(args, 'no_vae', False):
+                    x = samples  # already [-1,1] normalized by transforms
+                elif args.use_cached:
                     moments = samples
                     posterior = DiagonalGaussianDistribution(moments)
+                    x = posterior.sample().mul_(0.2325)
                 else:
                     posterior = vae.encode(samples)
-
-                # normalize the std of latent to be 1. Change it if you use a different tokenizer
-                x = posterior.sample().mul_(0.2325)
+                    # normalize the std of latent to be 1. Change it if you use a different tokenizer
+                    x = posterior.sample().mul_(0.2325)
 
             # forward
             with torch.cuda.amp.autocast():
@@ -177,7 +186,10 @@ def evaluate(model_without_ddp, vae, ema_params, args, epoch, batch_size=16, log
                 sampled_tokens = model_without_ddp.sample_tokens(bsz=batch_size, num_iter=args.num_iter, cfg=cfg,
                                                                  cfg_schedule=args.cfg_schedule, labels=labels_gen,
                                                                  temperature=args.temperature)
-                sampled_images = vae.decode(sampled_tokens / 0.2325)
+                if getattr(args, 'no_vae', False):
+                    sampled_images = sampled_tokens
+                else:
+                    sampled_images = vae.decode(sampled_tokens / 0.2325)
 
         # measure speed after the first generation batch
         if i >= 1:

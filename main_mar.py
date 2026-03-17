@@ -137,10 +137,24 @@ def get_args_parser():
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
 
+    # no-VAE pixel-space training
+    parser.add_argument('--no_vae', action='store_true',
+                        help='Bypass VAE, train directly on RGB pixel patches')
+
     return parser
 
 
 def main(args):
+    # no-VAE mode: override VAE params and validate
+    if args.no_vae:
+        if args.use_cached:
+            raise ValueError("--no_vae and --use_cached are mutually exclusive")
+        args.vae_stride = 1
+        args.vae_embed_dim = 3
+        token_embed_dim = args.vae_embed_dim * args.patch_size ** 2
+        print(f"[no-VAE] pixel-space mode: vae_stride=1, vae_embed_dim=3, "
+              f"patch_size={args.patch_size}, token_embed_dim={token_embed_dim}")
+
     misc.init_distributed_mode(args)
 
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
@@ -196,9 +210,12 @@ def main(args):
     )
 
     # define the vae and mar model
-    vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
-    for param in vae.parameters():
-        param.requires_grad = False
+    if args.no_vae:
+        vae = None
+    else:
+        vae = AutoencoderKL(embed_dim=args.vae_embed_dim, ch_mult=(1, 1, 2, 2, 4), ckpt_path=args.vae_path).cuda().eval()
+        for param in vae.parameters():
+            param.requires_grad = False
 
     model = mar.__dict__[args.model](
         img_size=args.img_size,
